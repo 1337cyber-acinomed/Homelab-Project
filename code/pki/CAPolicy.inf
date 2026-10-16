@@ -1,0 +1,32 @@
+;==============================================================================
+; Project Polaris
+; CAPolicy.inf
+;
+; Purpose:
+; Defines the policy configuration applied during installation of the
+; Project Polaris Offline Root Certification Authority (ROOTCA01).
+;
+; This file shall exist before installing the Active Directory
+; Certificate Services role.
+;==============================================================================
+
+[Version]
+Signature="$Windows NT$"
+
+[Certsrv_Server]
+RenewalKeyLength=4096
+RenewalValidityPeriod=Years
+RenewalValidityPeriodUnits=20
+CRLPeriod=Months
+CRLPeriodUnits=12
+AlternateSignatureAlgorithm=0
+
+[CRLDistributionPoint]
+; Intentionally left empty.
+; The self-signed Offline Root CA certificate shall not include
+; a CRL Distribution Point extension.
+
+[AuthorityInformationAccess]
+; Intentionally left empty.
+; The self-signed Offline Root CA certificate shall not include
+; an Authority Information Access extension.

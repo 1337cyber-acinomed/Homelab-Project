@@ -1,0 +1,53 @@
+---
+- name: Run Project Polaris backup orchestrator
+  hosts: homelab-node
+  gather_facts: false
+  tasks:
+    - name: Execute polaris-backup
+      command: /opt/project-polaris/config-backup/bin/polaris-backup
+      become: true
+      register: backup_result
+      failed_when:
+        - backup_result.rc != 0
+        - backup_result.rc != 5
+
+    - name: Note if a run was already in progress
+      debug:
+        msg: "polaris-backup was already running (lock held); this invocation was skipped, not failed."
+      when: backup_result.rc == 5
+
+    - name: Show orchestrator output
+      debug:
+        var: backup_result.stdout_lines
+      when: backup_result.rc != 5
+
+    - name: Find the most recent orchestrator log file
+      find:
+        paths: /opt/project-polaris/config-backup/logs/orchestrator
+        patterns: "*.log"
+      become: true
+      register: orchestrator_logs
+      when: backup_result.rc != 5
+
+    - name: Read the most recent orchestrator log
+      slurp:
+        src: "{{ (orchestrator_logs.files | sort(attribute='mtime') | last).path }}"
+      become: true
+      register: orchestrator_log_raw
+      when:
+        - backup_result.rc != 5
+        - orchestrator_logs.matched | default(0) > 0
+
+    - name: Decode the orchestrator log
+      set_fact:
+        orchestrator_log_text: "{{ orchestrator_log_raw.content | b64decode }}"
+      when:
+        - backup_result.rc != 5
+        - orchestrator_logs.matched | default(0) > 0
+
+    - name: Display the orchestrator log content
+      debug:
+        var: orchestrator_log_text
+      when:
+        - backup_result.rc != 5
+        - orchestrator_logs.matched | default(0) > 0

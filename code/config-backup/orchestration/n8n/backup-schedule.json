@@ -1,0 +1,131 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        176,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000012",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": "qwen2.5:14b-instruct-q5_k_m",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        48,
+        208
+      ],
+      "id": "00000000-0000-0000-0000-000000000013",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "loatjfUrKLXtLacn",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -32,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000014",
+      "name": "When chat message received",
+      "webhookId": "00000000-0000-0000-0000-000000000015"
+    },
+    {
+      "parameters": {
+        "description": "Lists all VMs and containers running on the AI Proxmox node, including their status, resource usage, and uptime.",
+        "workflowId": {
+          "__rl": true,
+          "value": "xFsRI7kaV4qWmwjy",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/xFsRI7kaV4qWmwjy",
+          "cachedResultName": "List Proxmox VMs"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        320,
+        192
+      ],
+      "id": "00000000-0000-0000-0000-000000000016",
+      "name": "Call 'List Proxmox VMs'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call 'List Proxmox VMs'": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "00000000-0000-0000-0000-000000000017",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "810925193843de973a15c6cad4d8e71bdd89050c477988ea63c6adee067b3b17"
+  },
+  "nodeGroups": [],
+  "id": "DAL9CkbTbp8Z7MdX",
+  "tags": []

@@ -1,0 +1,308 @@
+{
+  "name": "Run Polaris Backup",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000001",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "authentication": "privateKey",
+        "command": "ANSIBLE_STDOUT_CALLBACK=json ansible-playbook -i /root/ansible/inventory.ini /root/ansible/playbooks/run-polaris-backup.yml"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        160,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000002",
+      "name": "Execute a command",
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "Y8Eo3pK1E3oOpUWg",
+          "name": "SSH Private Key account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = JSON.parse($input.item.json.stdout);\nconst play = raw.plays[0];\n\nlet orchestratorTask = null;\nfor (const t of play.tasks) {\n  const hostResult = t.hosts['homelab-node'];\n  if (hostResult && hostResult.action === 'command') {\n    orchestratorTask = hostResult;\n    break;\n  }\n}\n\nif (!orchestratorTask) {\n  throw new Error('Could not find the polaris-backup command task in Ansible JSON output.');\n}\n\nconst rc = orchestratorTask.rc;\nconst stdout = orchestratorTask.stdout || '';\n\n// rc 5 = lock already held by another run - not a failure, nothing to classify\nif (rc === 5) {\n  return [{ json: { skipped: true, reason: 'lock_held' } }];\n}\n\nconst collectors = {\n  proxmox:    { display: 'Proxmox',  unchanged: 'Proxmox configuration is unchanged.' },\n  pfsense:    { display: 'pfSense',  unchanged: 'pfSense configuration is unchanged.' },\n  opnsense:   { display: 'OPNSense', unchanged: 'OPNSense configuration is unchanged.' },\n  docker:     { display: 'Docker01', unchanged: 'Docker01 configuration is unchanged.' },\n  admin01:    { display: 'Admin01',  unchanged: 'Admin01 configuration is unchanged.' },\n  'admin-ws': { display: 'Admin-WS', unchanged: 'Admin-WS configuration is unchanged.' },\n  switch:     { display: 'Switch',   unchanged: 'Switch configuration is unchanged.' },\n};\n\nconst results = [];\nfor (const [id, info] of Object.entries(collectors)) {\n  const failed = stdout.includes(`[ERROR] [${id}]`);\n  const succeeded = stdout.includes(`[SUCCESS] ${info.display} collector completed successfully.`);\n  const unchanged = stdout.includes(info.unchanged);\n\nlet status;\nif (failed) status = 'failed';\nelse if (unchanged) status = 'unchanged';\nelse if (succeeded) status = 'changed';\nelse status = 'unknown';\n\n  results.push({ collector: id, status });\n}\n\nreturn [{ json: { rc, results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000003",
+      "name": "Classification"
+    },
+    {
+      "parameters": {
+        "jsCode": "const vmidMap = {\n  pfsense: 101,\n  docker: 103,\n  admin01: 105,\n  'admin-ws': 201,\n};\n\nconst { rc, results } = $input.all()[0].json;\n\nconst needsCheck = results\n  .filter(r => r.status === 'failed' && vmidMap[r.collector] !== undefined)\n  .map(r => ({ collector: r.collector, vmid: vmidMap[r.collector] }));\n\nreturn needsCheck.map(item => ({ json: item }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000004",
+      "name": "Power-State",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const classification = $('Classification').all()[0].json;\nconst allResults = classification.results;\n\nlet checkedList = [];\ntry { checkedList = $('Power-State').all(); } catch (e) { checkedList = []; }\n\nlet powerStatuses = [];\ntry { powerStatuses = $('NTFY \\\"Digest\\\"').all(); } catch (e) { powerStatuses = []; }\n\nconst poweredOff = {};\ncheckedList.forEach((item, i) => {\n  const collector = item.json.collector;\n  const status = powerStatuses[i]?.json?.data?.status;\n  poweredOff[collector] = (status !== undefined && status !== 'running');\n});\n\nconst tierTable = {\n  proxmox:    { failure: true,  change: false },\n  pfsense:    { failure: true,  change: true },\n  opnsense:   { failure: true,  change: false },\n  docker:     { failure: false, change: false },\n  admin01:    { failure: true,  change: false },\n  'admin-ws': { failure: false, change: false },\n  switch:     { failure: false, change: false },\n};\n\nconst output = [];\n\nfor (const r of allResults) {\n  const tier = tierTable[r.collector] || { failure: false, change: false };\n\n  if (r.status === 'failed') {\n    const wasChecked = (r.collector in poweredOff);\n    const isPoweredOff = poweredOff[r.collector] === true;\n    if (wasChecked && isPoweredOff) continue; // Tier 0 - silent\n\n    const cannotCheck = !wasChecked;\n    output.push({\n      collector: r.collector,\n      reason: 'failed',\n      urgency: (tier.failure || cannotCheck) ? 'urgent' : 'digest',\n    });\n  } else if (r.status === 'changed' && tier.change) {\n    output.push({ collector: r.collector, reason: 'config_changed', urgency: 'urgent' });\n  }\n}\n\nreturn output.map(o => ({ json: o }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        160
+      ],
+      "id": "00000000-0000-0000-0000-000000000005",
+      "name": "Tiering"
+    },
+    {
+      "parameters": {
+        "url": "=https://192.168.10.124:8006/api2/json/nodes/homelab/qemu/{{ $json.vmid }}/status/current",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        656,
+        0
+      ],
+      "id": "00000000-0000-0000-0000-000000000006",
+      "name": "Proxmox Homelab API",
+      "alwaysOutputData": false,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "F62DDB0kjZtxPQbS",
+          "name": "Proxmox API Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.urgency === 'urgent');"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        128
+      ],
+      "id": "00000000-0000-0000-0000-000000000007",
+      "name": "Urgent Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().filter(i => i.json.urgency === 'digest');\nif (items.length === 0) return [];\n\nconst lines = items.map(i => `- ${i.json.collector}: ${i.json.reason}`);\nconst message = `Routine items from today's backup run:\\n${lines.join('\\n')}`;\n\nreturn [{ json: { message } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        304
+      ],
+      "id": "00000000-0000-0000-0000-000000000008",
+      "name": "Digest Items"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://orchestrator-n8n.example-tailnet.ts.net/polaris-backup-alerts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "={{ 'Polaris Alert: ' + $json.collector }}"
+            },
+            {
+              "name": "Priority",
+              "value": "={{ $json.reason === 'failed' ? '5' : '3' }}"
+            },
+            {
+              "name": "Tags",
+              "value": "={{ $json.reason === 'failed' ? 'rotating_light' : 'gear' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text",
+        "body": "=  {{ $json.reason === 'failed' ? $json.collector + ' collector failed and needs attention.' : $json.collector + ' configuration changed - review recommended.' }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        128
+      ],
+      "id": "00000000-0000-0000-0000-000000000009",
+      "name": "NTFY \"Urgent\""
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://orchestrator-n8n.example-tailnet.ts.net/polaris-backup-alerts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "Polaris Daily Summary"
+            },
+            {
+              "name": "Priority",
+              "value": "2"
+            },
+            {
+              "name": "Tags",
+              "value": "clipboard"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text",
+        "body": "={{ $json.message }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        304
+      ],
+      "id": "00000000-0000-0000-0000-000000000010",
+      "name": "NTFY \"Digest\""
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Execute a command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command": {
+      "main": [
+        [
+          {
+            "node": "Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification": {
+      "main": [
+        [
+          {
+            "node": "Power-State",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Tiering",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Power-State": {
+      "main": [
+        [
+          {
+            "node": "Proxmox Homelab API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tiering": {
+      "main": [
+        [
+          {
+            "node": "Urgent Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Digest Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Proxmox Homelab API": {
+      "main": [
+        []
+      ]
+    },
+    "Urgent Items": {
+      "main": [
+        [
+          {
+            "node": "NTFY \"Urgent\"",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digest Items": {
+      "main": [
+        [
+          {
+            "node": "NTFY \"Digest\"",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "00000000-0000-0000-0000-000000000011",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "810925193843de973a15c6cad4d8e71bdd89050c477988ea63c6adee067b3b17"
+  },
+  "nodeGroups": [],
+  "id": "hSJUrcjxc7EDYaqE",
+  "tags": []

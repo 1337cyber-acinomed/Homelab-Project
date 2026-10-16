@@ -1,0 +1,2171 @@
+#!/usr/bin/env bash
+
+###############################################################################
+#
+# Project Polaris
+#
+# Script:
+#     polaris-ai-backup
+#
+# Component:
+#     AI Node Configuration Backup Orchestrator
+#
+# Version:
+#     0.1.0
+#
+# Purpose:
+#     Coordinate configuration collection, validation, replication to
+#     NAS01 (NAS-AI share), copy validation, quarantine handling, and
+#     retention for the AI node's own Proxmox host.
+#
+# Current Scope:
+#     Single-purpose orchestrator, deliberately separate from
+#     bin/polaris-backup. Runs exactly one collector: proxmox-ai. This is
+#     not a registry-driven, multi-collector engine like polaris-backup -
+#     it exists specifically so the AI node's collection logic can be
+#     built, tested, and evolved independently, with zero risk of ever
+#     affecting Homelab's production orchestrator or its nine registered
+#     collectors. See the 3n runbook addendum (2026-09-14) for the full
+#     reasoning behind this design.
+#
+# Workflow:
+#     1. Acquire execution lock.
+#     2. Validate local prerequisites.
+#     3. Run the proxmox-ai collector.
+#     4. Validate the local collector output.
+#     5. Preserve valid output locally or quarantine invalid output.
+#     6. Copy valid output to NAS01 (NAS-AI share) when available.
+#     7. Validate the NAS01 copy.
+#     8. Promote valid NAS copies or quarantine invalid copies.
+#     9. Apply retention to validated backups.
+#    10. Apply separate retention to quarantined backups.
+#
+###############################################################################
+
+###############################################################################
+# Shell behavior
+###############################################################################
+
+set -u
+set -o pipefail
+
+###############################################################################
+# Constants
+###############################################################################
+
+readonly POLARIS_AI_BACKUP_NAME="Project Polaris AI Node Backup Orchestrator"
+readonly POLARIS_AI_BACKUP_VERSION="0.1.0"
+
+readonly POLARIS_COLLECTOR_NEW_OR_CHANGED=10
+readonly POLARIS_COLLECTOR_FAILED=11
+readonly POLARIS_COLLECTOR_NO_CHANGE=12
+
+# Raw collector public-interface result contract.
+readonly POLARIS_COLLECTOR_RESULT_SUCCESS=0
+readonly POLARIS_COLLECTOR_RESULT_ERROR=1
+readonly POLARIS_COLLECTOR_RESULT_NO_CHANGE=2
+
+###############################################################################
+# Load common library
+#
+# The common library owns shared Project Polaris path constants and the
+# orchestrator result-code contract (POLARIS_BACKUP_SUCCESS, etc.), shared
+# with bin/polaris-backup since both must agree on it exactly for n8n's
+# Classification/Tiering logic to interpret either engine's output
+# correctly. The orchestrator resolves only the library path needed to
+# bootstrap that import.
+###############################################################################
+
+POLARIS_AI_BACKUP_SCRIPT_DIRECTORY="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
+)"
+
+readonly POLARIS_COMMON_LIBRARY="${POLARIS_AI_BACKUP_SCRIPT_DIRECTORY}/../lib/polaris-common.sh"
+
+if [[ ! -r "${POLARIS_COMMON_LIBRARY}" ]]; then
+    printf 'ERROR: Project Polaris common library not found or unreadable: %s\n' \
+        "${POLARIS_COMMON_LIBRARY}" >&2
+    exit 2  # POLARIS_BACKUP_PREREQUISITE_FAILED - hardcoded: the common
+            # library (which defines this symbolically) is what just failed
+            # to load, so the symbol itself isn't available yet here.
+fi
+
+# shellcheck source=/dev/null
+source "${POLARIS_COMMON_LIBRARY}"
+
+###############################################################################
+# Component paths
+###############################################################################
+
+readonly POLARIS_COLLECTORS_DIRECTORY="${POLARIS_CONFIG_BACKUP_ROOT}/collectors"
+
+readonly POLARIS_PROXMOX_AI_COLLECTOR="${POLARIS_COLLECTORS_DIRECTORY}/proxmox-ai/proxmox_ai_collector.sh"
+
+readonly POLARIS_MANIFEST_VALIDATOR="${POLARIS_PROJECT_ROOT}/framework/verify-manifest.sh"
+
+###############################################################################
+# Local backup paths
+###############################################################################
+
+readonly POLARIS_LOCAL_ROOT="/staging"
+
+readonly POLARIS_LOCAL_CURRENT_ROOT="${POLARIS_LOCAL_ROOT}/current"
+
+readonly POLARIS_PROXMOX_AI_WORKING_DIRECTORY="${POLARIS_LOCAL_CURRENT_ROOT}/proxmox-ai"
+
+readonly POLARIS_LOCAL_VALIDATED_ROOT="${POLARIS_LOCAL_ROOT}/validated"
+readonly POLARIS_LOCAL_QUARANTINE_ROOT="${POLARIS_LOCAL_ROOT}/quarantine"
+
+readonly POLARIS_LOCAL_TROUBLESHOOTING_ROOT="${POLARIS_LOCAL_ROOT}/troubleshooting"
+
+readonly POLARIS_PROXMOX_AI_TROUBLESHOOTING_ROOT="${POLARIS_LOCAL_TROUBLESHOOTING_ROOT}/proxmox-ai"
+
+###############################################################################
+# Collector identity
+#
+# This orchestrator runs exactly one collector. Unlike bin/polaris-backup,
+# there is no registry, no dynamic dispatch, and no iteration - every
+# reference below is direct and explicit, deliberately, so a reader (human
+# or agent) never has to trace through array lookups to know what this
+# script actually does.
+###############################################################################
+
+readonly POLARIS_AI_COLLECTOR_ID="proxmox-ai"
+readonly POLARIS_AI_COLLECTOR_DISPLAY_NAME="AI Node Proxmox"
+readonly POLARIS_AI_COLLECTOR_BACKUP_PREFIX="Proxmox-AI"
+readonly POLARIS_AI_COLLECTOR_NO_CHANGE_MESSAGE="AI node Proxmox configuration is unchanged. Lifecycle processing was skipped."
+
+###############################################################################
+# NAS01 paths
+#
+# Deliberately a separate share (NAS-AI) from Homelab's own NAS-Backups -
+# not just a different subfolder within it. This is a second, independent
+# safety layer beyond this being a separate orchestrator entirely: even in
+# a scenario where something else went wrong, AI-node data cannot land
+# inside Homelab's own backup tree, because it is not the same destination
+# at all. See the 3n runbook addendum for the full reasoning.
+###############################################################################
+
+readonly POLARIS_NAS_MOUNT="/mnt/pve/NAS-AI"
+readonly POLARIS_NAS_BACKUP_ROOT="${POLARIS_NAS_MOUNT}/Project-Polaris"
+
+readonly POLARIS_NAS_VALIDATED_ROOT="${POLARIS_NAS_BACKUP_ROOT}/validated"
+readonly POLARIS_NAS_QUARANTINE_ROOT="${POLARIS_NAS_BACKUP_ROOT}/quarantine"
+readonly POLARIS_NAS_TEMPORARY_ROOT="${POLARIS_NAS_BACKUP_ROOT}/incomplete"
+
+###############################################################################
+# Retention
+###############################################################################
+
+readonly POLARIS_LOCAL_VALIDATED_RETENTION_DAYS=30
+readonly POLARIS_NAS_VALIDATED_RETENTION_DAYS=7
+
+readonly POLARIS_LOCAL_QUARANTINE_RETENTION_DAYS=30
+readonly POLARIS_NAS_QUARANTINE_RETENTION_DAYS=30
+readonly POLARIS_ORCHESTRATOR_LOG_RETENTION_DAYS=30
+
+###############################################################################
+# Lock configuration
+###############################################################################
+
+readonly POLARIS_LOCK_FILE="/run/lock/polaris-ai-backup.lock"
+
+###############################################################################
+# Module state
+###############################################################################
+
+POLARIS_RUN_TIMESTAMP=""
+POLARIS_LOCK_DESCRIPTOR=""
+POLARIS_ACTIVE_COLLECTOR=""
+
+###############################################################################
+# Function:
+#     main
+#
+# Purpose:
+#     Coordinate the single proxmox-ai collector's configuration-backup
+#     lifecycle.
+#
+# NOTE: incomplete as of this stage. Collector execution, lifecycle
+# processing (validate/preserve/archive/quarantine/NAS copy/promote/
+# retention), and the final Direct-execution trigger are added in stage 3,
+# once the lifecycle functions themselves (stage 2) exist to call.
+###############################################################################
+
+main() {
+
+    local collector_result
+    local lifecycle_result
+    local backup_name
+    local validated_directory
+    local quarantine_directory
+
+    log_info \
+        "Starting ${POLARIS_AI_BACKUP_NAME} v${POLARIS_AI_BACKUP_VERSION}"
+
+    _initialize_run || return $?
+    _apply_log_retention || return $?
+    _acquire_lock || return $?
+
+    trap '_release_lock' EXIT
+    trap '_handle_interruption' INT TERM HUP
+
+    _validate_local_environment || return $?
+    _prepare_local_directories || return $?
+
+    backup_name="${POLARIS_AI_COLLECTOR_BACKUP_PREFIX}-${POLARIS_RUN_TIMESTAMP}"
+    validated_directory="${POLARIS_LOCAL_VALIDATED_ROOT}/${POLARIS_AI_COLLECTOR_ID}/${backup_name}"
+    quarantine_directory="${POLARIS_LOCAL_QUARANTINE_ROOT}/${POLARIS_AI_COLLECTOR_ID}/${backup_name}"
+
+    POLARIS_ACTIVE_COLLECTOR="${POLARIS_AI_COLLECTOR_ID}"
+    _run_proxmox_ai_collector
+    collector_result=$?
+    POLARIS_ACTIVE_COLLECTOR=""
+
+    case "${collector_result}" in
+        "${POLARIS_COLLECTOR_NEW_OR_CHANGED}")
+            _process_collector_lifecycle \
+                "${POLARIS_AI_COLLECTOR_ID}" \
+                "${POLARIS_AI_COLLECTOR_DISPLAY_NAME}" \
+                "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" \
+                "${validated_directory}" \
+                "${quarantine_directory}"
+
+            lifecycle_result=$?
+
+            if (( lifecycle_result != POLARIS_BACKUP_SUCCESS )); then
+                operator_error \
+                    "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} backup lifecycle did not complete successfully."
+                return "${lifecycle_result}"
+            fi
+            ;;
+
+        "${POLARIS_COLLECTOR_NO_CHANGE}")
+            log_info \
+                "${POLARIS_AI_COLLECTOR_NO_CHANGE_MESSAGE}"
+            ;;
+
+        "${POLARIS_COLLECTOR_FAILED}")
+            operator_error \
+                "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collection failed. Lifecycle processing was skipped."
+
+            if [[ -d "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" ]] &&
+               [[ -n "$(find "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" \
+                    -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+
+                _quarantine_local_backup \
+                    "${POLARIS_AI_COLLECTOR_DISPLAY_NAME}" \
+                    "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" \
+                    "${quarantine_directory}" || \
+                    operator_error \
+                        "Failed ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector output could not be quarantined."
+            fi
+
+            return "${POLARIS_BACKUP_FAILED}"
+            ;;
+
+        *)
+            operator_error \
+                "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector wrapper returned unexpected status: ${collector_result}"
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+            ;;
+    esac
+
+    _apply_all_retention || return $?
+
+    log_success "${POLARIS_AI_BACKUP_NAME} completed successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _run_proxmox_ai_collector
+#
+# Purpose:
+#     Run the AI node's Proxmox collector.
+###############################################################################
+
+_run_proxmox_ai_collector() {
+
+    local collector_result
+    local collector_start_seconds
+    local collector_elapsed_seconds
+
+    collector_start_seconds="${SECONDS}"
+
+    if [[ ! -r "${POLARIS_PROXMOX_AI_COLLECTOR}" ]]; then
+        collector_elapsed_seconds=$(( SECONDS - collector_start_seconds ))
+
+        operator_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector is not readable: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector is not readable: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    # shellcheck source=/dev/null
+    source "${POLARIS_PROXMOX_AI_COLLECTOR}" || {
+        collector_elapsed_seconds=$(( SECONDS - collector_start_seconds ))
+
+        operator_error "Unable to load ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        log_error "Unable to load ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    }
+
+    if ! declare -F collect_proxmox_ai >/dev/null 2>&1; then
+        collector_elapsed_seconds=$(( SECONDS - collector_start_seconds ))
+
+        operator_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector public interface is unavailable: collect_proxmox_ai"
+        log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector interface is unavailable: collect_proxmox_ai"
+        log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    operator_info "Running ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector."
+    log_info "Starting ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector."
+    log_info "Collector name: ${MODULE_DISPLAY_NAME:-${POLARIS_AI_COLLECTOR_DISPLAY_NAME}}"
+    log_info "Collector Version: ${MODULE_VERSION:-unknown}"
+    log_info "Run Identity: ${POLARIS_RUN_TIMESTAMP}"
+    log_info "Collector destination: ${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"
+
+    log_info "Invoking ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector interface: collect_proxmox_ai"
+    (
+        if [[ -n "${POLARIS_LOCK_DESCRIPTOR:-}" ]]; then
+            exec {POLARIS_LOCK_DESCRIPTOR}>&-
+        fi
+
+        collect_proxmox_ai "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"
+    )
+    collector_result=$?
+
+    collector_elapsed_seconds=$(( SECONDS - collector_start_seconds ))
+
+    case "${collector_result}" in
+        "${POLARIS_COLLECTOR_RESULT_SUCCESS}")
+            operator_success "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector completed successfully."
+            log_info "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector completed successfully."
+            log_info "Collector execution completed successfully."
+            log_info "Collector exit code: ${collector_result}"
+            log_info "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+            return "${POLARIS_COLLECTOR_NEW_OR_CHANGED}"
+            ;;
+
+        "${POLARIS_COLLECTOR_RESULT_ERROR}")
+            operator_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector encountered an error."
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector failed"
+            log_error "Collector exit code: ${collector_result}"
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+            return "${POLARIS_COLLECTOR_FAILED}"
+            ;;
+
+        "${POLARIS_COLLECTOR_RESULT_NO_CHANGE}")
+            operator_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector returned unsupported no-change status."
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector unexpectedly returned no-change."
+            log_error "Collector exit code: ${collector_result}"
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+            ;;
+
+        *)
+            operator_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector returned an unexpected result."
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector returned unexpected exit code: ${collector_result}"
+            log_error "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector elapsed time: ${collector_elapsed_seconds} seconds."
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+            ;;
+    esac
+}
+
+###############################################################################
+# Function:
+#     _initialize_run
+#
+# Purpose:
+#     Generate the run timestamp, open the per-run log file, and record
+#     startup information.
+###############################################################################
+
+_initialize_run() {
+
+    local orchestrator_log_directory
+
+    if ! POLARIS_RUN_TIMESTAMP="$(generate_timestamp)"; then
+        operator_error \
+            "Unable to generate backup timestamp."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${POLARIS_RUN_TIMESTAMP}" ]]; then
+        operator_error \
+            "Backup timestamp was generated as an empty value."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    orchestrator_log_directory="${POLARIS_LOG_DIR}/orchestrator"
+
+    POLARIS_ACTIVE_LOG_FILE="${orchestrator_log_directory}/project-polaris-ai-backup-${POLARIS_RUN_TIMESTAMP}.log"
+
+    if ! log_info \
+        "Project Polaris AI Node backup orchestrator initialized."; then
+
+        operator_error \
+            "Unable to initialize the orchestrator run log."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_info \
+        "Run timestamp: ${POLARIS_RUN_TIMESTAMP}" || \
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+
+    log_info \
+        "Registered collector: ${POLARIS_AI_COLLECTOR_DISPLAY_NAME}" || \
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+
+    operator_info \
+        "Orchestrator initialized"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _apply_log_retention
+#
+# Purpose:
+#     Remove expired per-run orchestrator logs before scheduled execution
+#     continues. The active run log and size-based framework-log rotation
+#     are preserved independently.
+###############################################################################
+
+_apply_log_retention() {
+
+    local orchestrator_log_directory="${POLARIS_LOG_DIR}/orchestrator"
+    local expired_log
+    local retention_failed=0
+
+    if [[ ! -d "${orchestrator_log_directory}" ]]; then
+        return "${POLARIS_BACKUP_SUCCESS}"
+    fi
+
+    while IFS= read -r -d '' expired_log; do
+        if [[ "${expired_log}" == "${POLARIS_ACTIVE_LOG_FILE}" ]]; then
+            continue
+        fi
+
+        if ! rm -f -- "${expired_log}"; then
+            operator_warning "Unable to remove expired orchestrator log: ${expired_log}"
+            log_warning "Unable to remove expired orchestrator log: ${expired_log}"
+            retention_failed=1
+        else
+            log_info "Removed expired orchestrator log: ${expired_log}"
+        fi
+    done < <(
+        find "${orchestrator_log_directory}" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type f \
+            -name 'project-polaris-ai-backup-*.log' \
+            -mtime "+${POLARIS_ORCHESTRATOR_LOG_RETENTION_DAYS}" \
+            -print0
+    )
+
+    if (( retention_failed != 0 )); then
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_info "Orchestrator log retention completed: ${POLARIS_ORCHESTRATOR_LOG_RETENTION_DAYS} days."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _acquire_lock
+#
+# Purpose:
+#     Prevent overlapping executions.
+###############################################################################
+
+_acquire_lock() {
+
+    local lock_directory
+
+    lock_directory="$(dirname -- "${POLARIS_LOCK_FILE}")"
+
+    if ! command -v flock >/dev/null 2>&1; then
+        operator_error "Required command not found: flock"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if ! create_directory "${lock_directory}"; then
+        operator_error "Unable to create lock directory: ${lock_directory}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! exec {POLARIS_LOCK_DESCRIPTOR}> "${POLARIS_LOCK_FILE}"; then
+        operator_error "Unable to open lock file: ${POLARIS_LOCK_FILE}"
+        POLARIS_LOCK_DESCRIPTOR=""
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! flock -n "${POLARIS_LOCK_DESCRIPTOR}"; then
+        operator_error "Another Project Polaris AI backup operation is already running."
+
+        exec {POLARIS_LOCK_DESCRIPTOR}>&-
+        POLARIS_LOCK_DESCRIPTOR=""
+
+        return "${POLARIS_BACKUP_LOCKED}"
+    fi
+
+    log_info "Execution lock acquired: ${POLARIS_LOCK_FILE}"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _release_lock
+#
+# Purpose:
+#     Release the execution lock.
+###############################################################################
+
+_release_lock() {
+
+    if [[ -z "${POLARIS_LOCK_DESCRIPTOR}" ]]; then
+        return "${POLARIS_BACKUP_SUCCESS}"
+    fi
+
+    if [[ ! "${POLARIS_LOCK_DESCRIPTOR}" =~ ^[0-9]+$ ]]; then
+        operator_warning "Lock descriptor is invalid and could not be explicitly released."
+        POLARIS_LOCK_DESCRIPTOR=""
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! flock -u "${POLARIS_LOCK_DESCRIPTOR}"; then
+        operator_warning "Unable to explicitly unlock: ${POLARIS_LOCK_FILE}"
+    fi
+
+    exec {POLARIS_LOCK_DESCRIPTOR}>&-
+    POLARIS_LOCK_DESCRIPTOR=""
+
+    log_info "Execution lock released."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _handle_interruption
+#
+# Purpose:
+#     Handle termination signals while preserving working data.
+###############################################################################
+
+_handle_interruption() {
+
+    operator_error "Backup workflow interrupted."
+
+    exit "${POLARIS_BACKUP_FAILED}"
+}
+
+###############################################################################
+# Function:
+#     _validate_local_environment
+#
+# Purpose:
+#     Confirm local scripts, commands, and directories are available.
+###############################################################################
+
+_validate_local_environment() {
+
+    local required_command
+    local required_commands=(
+        "bash"
+        "date"
+        "dirname"
+        "find"
+        "flock"
+        "mv"
+        "rm"
+    )
+
+    if (( EUID != 0 )); then
+        operator_error "The backup orchestrator must be run as root."
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    for required_command in "${required_commands[@]}"; do
+        if ! command -v "${required_command}" >/dev/null 2>&1; then
+            operator_error "Required command not found: ${required_command}"
+            return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+        fi
+    done
+
+    if [[ ! -f "${POLARIS_PROXMOX_AI_COLLECTOR}" ]]; then
+        operator_error \
+            "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector not found: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if [[ ! -r "${POLARIS_PROXMOX_AI_COLLECTOR}" ]]; then
+        operator_error \
+            "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} collector is not readable: ${POLARIS_PROXMOX_AI_COLLECTOR}"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if [[ ! -f "${POLARIS_MANIFEST_VALIDATOR}" ]]; then
+        operator_error "Manifest validator not found: ${POLARIS_MANIFEST_VALIDATOR}"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if [[ ! -r "${POLARIS_MANIFEST_VALIDATOR}" ]]; then
+        operator_error "Manifest validator is not readable: ${POLARIS_MANIFEST_VALIDATOR}"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if [[ ! -d "${POLARIS_LOCAL_ROOT}" ]]; then
+        if ! create_directory "${POLARIS_LOCAL_ROOT}"; then
+            operator_error "Unable to create local backup root: ${POLARIS_LOCAL_ROOT}"
+            return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+        fi
+    fi
+
+    if [[ ! -w "${POLARIS_LOCAL_ROOT}" ]]; then
+        operator_error "Local backup root is not writable: ${POLARIS_LOCAL_ROOT}"
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    log_info "Local backup environment validated for ${POLARIS_AI_COLLECTOR_DISPLAY_NAME}."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _recover_abandoned_working_directory
+#
+# Purpose:
+#     Preserve an abandoned collector working directory in quarantine,
+#     record the recovery reason, and allow the orchestrator startup
+#     sequence to continue without pre-creating the collector-owned
+#     staging root.
+###############################################################################
+
+_recover_abandoned_working_directory() {
+
+    local collector_id="$1"
+    local collector_display_name="$2"
+    local working_directory="$3"
+    local quarantine_directory
+    local quarantine_reason_file
+    local collision_index=0
+
+    if [[ -z "${collector_id}" || -z "${collector_display_name}" || -z "${working_directory}" ]]; then
+        operator_error "Interrupted-run recovery received incomplete collector information."
+        log_error "Interrupted-run recovery requires collector ID, display name, and working directory."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    quarantine_directory="${POLARIS_LOCAL_QUARANTINE_ROOT}/${collector_id}/interrupted-run-${POLARIS_RUN_TIMESTAMP}"
+
+    while [[ -e "${quarantine_directory}" ]]; do
+        collision_index=$(( collision_index + 1 ))
+        quarantine_directory="${POLARIS_LOCAL_QUARANTINE_ROOT}/${collector_id}/interrupted-run-${POLARIS_RUN_TIMESTAMP}-${collision_index}"
+    done
+
+    if ! mv -- "${working_directory}" "${quarantine_directory}"; then
+        operator_error "Unable to preserve abandoned ${collector_display_name} working data."
+        log_error "Unable to move abandoned working directory from ${working_directory} to ${quarantine_directory}."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    quarantine_reason_file="${quarantine_directory}/QUARANTINE-REASON.txt"
+
+    if ! cat >"${quarantine_reason_file}" <<EOF
+Project Polaris interrupted-run preservation
+
+Collector: ${collector_display_name}
+Original Path: ${working_directory}
+Preserved Path: ${quarantine_directory}
+Preserved At (UTC): $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+Reason: Non-empty collector working directory remained from an earlier or interrupted run.
+Disposition: Preserved automatically during orchestrator startup; collection continued with a clean workspace.
+EOF
+    then
+        operator_error "Unable to record quarantine reason for abandoned ${collector_display_name} data."
+        log_error "Unable to write quarantine reason file: ${quarantine_reason_file}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! chmod 600 "${quarantine_reason_file}"; then
+        operator_error "Unable to secure quarantine reason for abandoned ${collector_display_name} data."
+        log_error "Unable to set permissions on quarantine reason file: ${quarantine_reason_file}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    operator_warning "Preserved abandoned ${collector_display_name} working data and continued startup."
+    log_warning "Abandoned ${collector_display_name} working data preserved at: ${quarantine_directory}"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _prepare_local_directories
+#
+# Purpose:
+#     Prepare local validated and quarantine storage locations for the
+#     proxmox-ai collector.
+###############################################################################
+
+_prepare_local_directories() {
+
+    local required_directory
+    local required_directories=(
+        "${POLARIS_LOCAL_CURRENT_ROOT}"
+        "${POLARIS_LOCAL_VALIDATED_ROOT}"
+        "${POLARIS_LOCAL_QUARANTINE_ROOT}"
+        "${POLARIS_LOCAL_ROOT}/archive"
+        "${POLARIS_LOCAL_TROUBLESHOOTING_ROOT}"
+        "${POLARIS_LOCAL_VALIDATED_ROOT}/${POLARIS_AI_COLLECTOR_ID}"
+        "${POLARIS_LOCAL_QUARANTINE_ROOT}/${POLARIS_AI_COLLECTOR_ID}"
+        "${POLARIS_LOCAL_ROOT}/archive/${POLARIS_AI_COLLECTOR_ID}"
+        "${POLARIS_PROXMOX_AI_TROUBLESHOOTING_ROOT}"
+    )
+
+    for required_directory in "${required_directories[@]}"; do
+        if ! create_directory "${required_directory}"; then
+            operator_error "Unable to create local backup directory: ${required_directory}"
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        fi
+    done
+
+    if [[ -e "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" && ! -d "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" ]]; then
+        operator_error \
+            "${POLARIS_AI_COLLECTOR_DISPLAY_NAME} working path exists but is not a directory: ${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -d "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" ]] &&
+       [[ -n "$(find "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        if ! _recover_abandoned_working_directory \
+            "${POLARIS_AI_COLLECTOR_ID}" \
+            "${POLARIS_AI_COLLECTOR_DISPLAY_NAME}" \
+            "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"; then
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        fi
+    fi
+
+    if [[ -d "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}" ]]; then
+        if ! rmdir -- "${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"; then
+            operator_error \
+                "Unable to remove empty ${POLARIS_AI_COLLECTOR_DISPLAY_NAME} working directory: ${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"
+            log_error \
+                "Collector-owned staging root could not be removed before invocation: ${POLARIS_PROXMOX_AI_WORKING_DIRECTORY}"
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        fi
+    fi
+
+    log_info "Local backup directories prepared for ${POLARIS_AI_COLLECTOR_DISPLAY_NAME}."
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+_process_collector_lifecycle() {
+
+    local collector_name="${1:-}"
+    local collector_display_name="${2:-}"
+    local working_directory="${3:-}"
+    local validated_directory="${4:-}"
+    local quarantine_directory="${5:-}"
+
+    local backup_directory_name
+    local archive_filename
+    local checksum_filename
+
+    local local_archive_directory
+    local local_archive_path
+    local local_archive_checksum_path
+
+    local nas_temporary_directory
+    local nas_final_directory
+    local nas_quarantine_directory
+    local nas_archive_path
+    local nas_archive_checksum_path
+
+    local lifecycle_result
+
+    if [[ -z "${collector_name}" ]]; then
+        operator_error \
+            "Collector lifecycle received an empty collector name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Collector lifecycle received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${working_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} lifecycle received an empty working directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${validated_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} lifecycle received an empty validated destination."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${quarantine_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} lifecycle received an empty quarantine destination."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    backup_directory_name="$(
+        basename -- "${validated_directory}"
+    )"
+
+    if [[ -z "${backup_directory_name}" ]]; then
+        operator_error \
+            "${collector_display_name} lifecycle could not determine the backup directory name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    archive_filename="${backup_directory_name}.tar.zst"
+    checksum_filename="${archive_filename}.sha256"
+
+    local_archive_directory="${POLARIS_LOCAL_ROOT}/archive/${collector_name}/${backup_directory_name}"
+    local_archive_path="${local_archive_directory}/${archive_filename}"
+    local_archive_checksum_path="${local_archive_directory}/${checksum_filename}"
+
+    nas_temporary_directory="${POLARIS_NAS_TEMPORARY_ROOT}/${collector_name}/${backup_directory_name}"
+    nas_final_directory="${POLARIS_NAS_VALIDATED_ROOT}/${collector_name}/${backup_directory_name}"
+    nas_quarantine_directory="${POLARIS_NAS_QUARANTINE_ROOT}/${collector_name}/${backup_directory_name}"
+
+    nas_archive_path="${nas_temporary_directory}/${archive_filename}"
+    nas_archive_checksum_path="${nas_temporary_directory}/${checksum_filename}"
+
+    log_info "========================================================================"
+    log_info "LIFECYCLE START: ${collector_display_name}"
+    log_info "Collector name: ${collector_name}"
+    log_info "Working directory: ${working_directory}"
+    log_info "Validated destination: ${validated_directory}"
+    log_info "Local archive: ${local_archive_path}"
+    log_info "NAS destination: ${nas_final_directory}"
+    log_info "========================================================================"
+
+    _validate_local_backup \
+        "${collector_display_name}" \
+        "${working_directory}"
+
+    lifecycle_result=$?
+
+    if (( lifecycle_result != POLARIS_BACKUP_SUCCESS )); then
+
+        _quarantine_local_backup \
+            "${collector_display_name}" \
+            "${working_directory}" \
+            "${quarantine_directory}" || {
+
+            operator_error \
+                "${collector_display_name} backup could not be moved to local quarantine."
+
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        }
+
+        operator_error \
+            "${collector_display_name} local backup validation failed."
+
+        log_info "========================================================================"
+        log_info "LIFECYCLE END: ${collector_display_name}"
+        log_info "Result: VALIDATION_FAILED"
+        log_info "========================================================================"
+
+        return "${lifecycle_result}"
+    fi
+
+    _preserve_local_backup \
+        "${collector_display_name}" \
+        "${working_directory}" \
+        "${validated_directory}" || return $?
+
+    _create_local_archive \
+        "${collector_display_name}" \
+        "${validated_directory}" \
+        "${local_archive_directory}" \
+        "${local_archive_path}" \
+        "${local_archive_checksum_path}" || return $?
+
+    if ! _nas_is_available; then
+
+        operator_warning \
+            "NAS01 is unavailable. The ${collector_display_name} archive was preserved locally."
+
+        log_info "========================================================================"
+        log_info "LIFECYCLE END: ${collector_display_name}"
+        log_info "Result: LOCAL_ARCHIVE_ONLY"
+        log_info "Local archive: ${local_archive_path}"
+        log_info "========================================================================"
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    _copy_to_nas_temporary \
+        "${collector_display_name}" \
+        "${local_archive_path}" \
+        "${local_archive_checksum_path}" \
+        "${nas_temporary_directory}" \
+        "${nas_archive_path}" \
+        "${nas_archive_checksum_path}"
+
+    lifecycle_result=$?
+
+    if (( lifecycle_result != POLARIS_BACKUP_SUCCESS )); then
+
+        if [[ -e "${nas_temporary_directory}" ]]; then
+            _quarantine_nas_copy \
+                "${collector_display_name}" \
+                "${nas_temporary_directory}" \
+                "${nas_quarantine_directory}" || {
+
+                operator_error \
+                    "Incomplete ${collector_display_name} NAS copy could not be quarantined."
+            }
+        fi
+
+        log_info "========================================================================"
+        log_info "LIFECYCLE END: ${collector_display_name}"
+        log_info "Result: NAS_COPY_FAILED"
+        log_info "========================================================================"
+
+        return "${lifecycle_result}"
+    fi
+
+    _validate_nas_copy \
+        "${collector_display_name}" \
+        "${nas_temporary_directory}" \
+        "${nas_archive_path}" \
+        "${nas_archive_checksum_path}"
+
+    lifecycle_result=$?
+
+    if (( lifecycle_result != POLARIS_BACKUP_SUCCESS )); then
+
+        _quarantine_nas_copy \
+            "${collector_display_name}" \
+            "${nas_temporary_directory}" \
+            "${nas_quarantine_directory}" || {
+
+            operator_error \
+                "Invalid ${collector_display_name} NAS copy could not be quarantined."
+        }
+
+        log_info "========================================================================"
+        log_info "LIFECYCLE END: ${collector_display_name}"
+        log_info "Result: NAS_VALIDATION_FAILED"
+        log_info "========================================================================"
+
+        return "${lifecycle_result}"
+    fi
+
+    _promote_nas_copy \
+        "${collector_display_name}" \
+        "${nas_temporary_directory}" \
+        "${nas_final_directory}" || return $?
+
+    log_success \
+        "${collector_display_name} backup lifecycle completed successfully."
+
+    log_info "========================================================================"
+    log_info "LIFECYCLE END: ${collector_display_name}"
+    log_info "Result: SUCCESS"
+    log_info "Local archive: ${local_archive_path}"
+    log_info "NAS backup: ${nas_final_directory}"
+    log_info "========================================================================"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _validate_local_backup
+#
+# Purpose:
+#     Validate one collector's staging output.
+#
+# Arguments:
+#     $1 - Collector display name
+#     $2 - Collector working directory
+###############################################################################
+
+_validate_local_backup() {
+
+    local collector_display_name="${1:-}"
+    local working_directory="${2:-}"
+    local validation_result
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Local validation received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${working_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} validation received an empty working directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -d "${working_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} working directory does not exist: ${working_directory}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ -z "$(
+        find "${working_directory}" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -print \
+            -quit \
+            2>/dev/null
+    )" ]]; then
+
+        operator_error \
+            "${collector_display_name} working directory is empty: ${working_directory}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ ! -r "${POLARIS_MANIFEST_VALIDATOR}" ]]; then
+        operator_error \
+            "Manifest validator is not readable: ${POLARIS_MANIFEST_VALIDATOR}"
+
+        return "${POLARIS_BACKUP_PREREQUISITE_FAILED}"
+    fi
+
+    if ! declare -F verify_manifest >/dev/null 2>&1; then
+
+        # shellcheck source=/dev/null
+        source "${POLARIS_MANIFEST_VALIDATOR}" || {
+            operator_error \
+                "Unable to load manifest validator: ${POLARIS_MANIFEST_VALIDATOR}"
+
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        }
+    fi
+
+    if ! declare -F verify_manifest >/dev/null 2>&1; then
+        operator_error \
+            "Manifest validator public interface is unavailable: verify_manifest"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_info \
+        "Validating local ${collector_display_name} backup."
+
+    verify_manifest "${working_directory}"
+    validation_result=$?
+
+    if (( validation_result != 0 )); then
+        operator_error \
+            "${collector_display_name} manifest validation failed with exit code ${validation_result}."
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    log_success \
+        "Local ${collector_display_name} backup validated successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _preserve_local_backup
+#
+# Purpose:
+#     Move one collector's validated output into timestamped local storage.
+#
+# Arguments:
+#     $1 - Collector display name
+#     $2 - Collector working directory
+#     $3 - Local validated destination
+###############################################################################
+
+_preserve_local_backup() {
+
+    local collector_display_name="${1:-}"
+    local working_directory="${2:-}"
+    local validated_directory="${3:-}"
+    local destination_parent
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Local preservation received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${working_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} preservation received an empty working directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${validated_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} preservation received an empty validated destination."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -d "${working_directory}" ]]; then
+        operator_error \
+            "Validated ${collector_display_name} working directory is missing: ${working_directory}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ -e "${validated_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} validated destination already exists: ${validated_directory}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    destination_parent="$(
+        dirname -- "${validated_directory}"
+    )"
+
+    if ! create_directory "${destination_parent}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} validated parent directory: ${destination_parent}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! safe_move \
+        "${working_directory}" \
+        "${validated_directory}"; then
+
+        operator_error \
+            "Unable to preserve validated ${collector_display_name} backup."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_success \
+        "Validated ${collector_display_name} backup preserved."
+
+    log_info \
+        "Validated backup: ${validated_directory}"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _create_local_archive
+#
+# Purpose:
+#     Create a compressed archive and checksum from one collector's validated
+#     local backup.
+#
+# Arguments:
+#     $1 - Collector display name
+#     $2 - Validated local backup directory
+#     $3 - Local archive directory
+#     $4 - Local archive path
+#     $5 - Local archive checksum path
+###############################################################################
+
+_create_local_archive() {
+
+    local collector_display_name="${1:-}"
+    local validated_directory="${2:-}"
+    local archive_directory="${3:-}"
+    local archive_path="${4:-}"
+    local checksum_path="${5:-}"
+
+    local archive_filename
+    local checksum_filename
+    local backup_parent
+    local backup_name
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Archive creation received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${validated_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} archive creation received an empty validated directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${archive_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} archive creation received an empty archive directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${archive_path}" ]]; then
+        operator_error \
+            "${collector_display_name} archive creation received an empty archive path."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${checksum_path}" ]]; then
+        operator_error \
+            "${collector_display_name} archive creation received an empty checksum path."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -d "${validated_directory}" ]]; then
+        operator_error \
+            "Validated ${collector_display_name} backup does not exist: ${validated_directory}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ -e "${archive_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} archive workspace already exists: ${archive_directory}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    archive_filename="$(
+        basename -- "${archive_path}"
+    )"
+
+    checksum_filename="$(
+        basename -- "${checksum_path}"
+    )"
+
+    backup_parent="$(
+        dirname -- "${validated_directory}"
+    )"
+
+    backup_name="$(
+        basename -- "${validated_directory}"
+    )"
+
+    if ! create_directory "${archive_directory}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} archive workspace: ${archive_directory}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_info \
+        "Creating compressed ${collector_display_name} backup archive."
+
+    log_info \
+        "Local archive: ${archive_path}"
+
+    if ! tar \
+        --zstd \
+        --create \
+        --sort=name \
+        --preserve-permissions \
+        --file "${archive_path}" \
+        --directory "${backup_parent}" \
+        "${backup_name}"; then
+
+        operator_error \
+            "Unable to create compressed ${collector_display_name} backup archive."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -s "${archive_path}" ]]; then
+        operator_error \
+            "${collector_display_name} archive was not created or is empty: ${archive_path}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_info \
+        "Generating ${collector_display_name} archive checksum."
+
+    if ! (
+        cd -- "${archive_directory}" &&
+        sha256sum "${archive_filename}" > "${checksum_filename}"
+    ); then
+        operator_error \
+            "Unable to generate ${collector_display_name} archive checksum."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -s "${checksum_path}" ]]; then
+        operator_error \
+            "${collector_display_name} archive checksum was not created: ${checksum_path}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_success \
+        "${collector_display_name} archive and checksum created successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _quarantine_local_backup
+#
+# Purpose:
+#     Move one collector's failed staging output into local quarantine.
+#
+# Arguments:
+#     $1 - Collector display name
+#     $2 - Collector working directory
+#     $3 - Local quarantine destination
+###############################################################################
+
+_quarantine_local_backup() {
+
+    local collector_display_name="${1:-}"
+    local working_directory="${2:-}"
+    local quarantine_directory="${3:-}"
+    local destination_parent
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Local quarantine received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${working_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} quarantine received an empty working directory."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${quarantine_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} quarantine received an empty destination."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -e "${working_directory}" ]]; then
+        operator_error \
+            "No ${collector_display_name} working data exists to quarantine: ${working_directory}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ -e "${quarantine_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} quarantine destination already exists: ${quarantine_directory}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    destination_parent="$(
+        dirname -- "${quarantine_directory}"
+    )"
+
+    if ! create_directory "${destination_parent}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} quarantine parent directory: ${destination_parent}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! safe_move \
+        "${working_directory}" \
+        "${quarantine_directory}"; then
+
+        operator_error \
+            "Unable to move failed ${collector_display_name} backup into quarantine."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    operator_warning \
+        "Failed ${collector_display_name} backup moved to quarantine."
+
+    log_info \
+        "Quarantined backup: ${quarantine_directory}"
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _nas_is_available
+#
+# Purpose:
+#     Determine whether NAS01 is mounted and writable.
+###############################################################################
+
+_nas_is_available() {
+
+    if ! command_exists "mountpoint"; then
+        operator_error \
+            "Required command is unavailable: mountpoint"
+        return 1
+    fi
+
+    if [[ ! -d "${POLARIS_NAS_MOUNT}" ]]; then
+        operator_warning \
+            "NAS01 mount directory does not exist: ${POLARIS_NAS_MOUNT}"
+        return 1
+    fi
+
+    if ! mountpoint -q -- "${POLARIS_NAS_MOUNT}"; then
+        operator_warning \
+            "NAS01 is not mounted at: ${POLARIS_NAS_MOUNT}"
+        return 1
+    fi
+
+    if [[ ! -r "${POLARIS_NAS_MOUNT}" ]]; then
+        operator_warning \
+            "NAS01 mount is not readable: ${POLARIS_NAS_MOUNT}"
+        return 1
+    fi
+
+    if [[ ! -w "${POLARIS_NAS_MOUNT}" ]]; then
+        operator_warning \
+            "NAS01 mount is not writable: ${POLARIS_NAS_MOUNT}"
+        return 1
+    fi
+
+    log_success \
+        "NAS01 is available at: ${POLARIS_NAS_MOUNT}"
+
+    return 0
+}
+
+###############################################################################
+# Function:
+#     _copy_to_nas_temporary
+#
+# Purpose:
+#     Copy one collector's local archive and checksum into temporary NAS
+#     storage.
+#
+# Arguments:
+#     $1 - Collector display name
+#     $2 - Local archive path
+#     $3 - Local archive checksum path
+#     $4 - NAS temporary directory
+#     $5 - NAS archive path
+#     $6 - NAS archive checksum path
+###############################################################################
+
+_copy_to_nas_temporary() {
+
+    local collector_display_name="${1:-}"
+    local local_archive_path="${2:-}"
+    local local_checksum_path="${3:-}"
+    local nas_temporary_directory="${4:-}"
+    local nas_archive_path="${5:-}"
+    local nas_checksum_path="${6:-}"
+
+    local temporary_parent
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "NAS copy received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -f "${local_archive_path}" ]]; then
+        operator_error \
+            "${collector_display_name} local archive does not exist: ${local_archive_path}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ ! -f "${local_checksum_path}" ]]; then
+        operator_error \
+            "${collector_display_name} local checksum does not exist: ${local_checksum_path}"
+
+        return "${POLARIS_BACKUP_FAILED}"
+    fi
+
+    if [[ -z "${nas_temporary_directory}" ]] ||
+       [[ -z "${nas_archive_path}" ]] ||
+       [[ -z "${nas_checksum_path}" ]]; then
+
+        operator_error \
+            "${collector_display_name} NAS copy received incomplete destination context."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! _nas_is_available; then
+        operator_warning \
+            "NAS01 became unavailable before the ${collector_display_name} copy began."
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ -e "${nas_temporary_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS temporary destination already exists: ${nas_temporary_directory}"
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    temporary_parent="$(
+        dirname -- "${nas_temporary_directory}"
+    )"
+
+    if ! create_directory "${temporary_parent}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} NAS temporary parent: ${temporary_parent}"
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if ! create_directory "${nas_temporary_directory}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} NAS temporary directory: ${nas_temporary_directory}"
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_info \
+        "Copying ${collector_display_name} archive to NAS01 temporary storage."
+
+    log_info \
+        "NAS temporary destination: ${nas_temporary_directory}"
+
+    if ! safe_copy_file \
+        "${local_archive_path}" \
+        "${nas_archive_path}"; then
+
+        operator_error \
+            "Unable to copy ${collector_display_name} archive to NAS01."
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if ! safe_copy_file \
+        "${local_checksum_path}" \
+        "${nas_checksum_path}"; then
+
+        operator_error \
+            "Unable to copy ${collector_display_name} checksum to NAS01."
+
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_success \
+        "${collector_display_name} archive copied to NAS01 temporary storage."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _validate_nas_backup
+#
+# Purpose:
+#     Validate the temporary NAS01 copy using its manifest.
+###############################################################################
+
+_validate_nas_copy() {
+
+    local collector_display_name="${1:-}"
+    local nas_temporary_directory="${2:-}"
+    local nas_archive_path="${3:-}"
+    local nas_checksum_path="${4:-}"
+    local checksum_filename
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "NAS validation received an empty collector display name."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -d "${nas_temporary_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS temporary directory does not exist: ${nas_temporary_directory}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if ! _nas_is_available; then
+        operator_warning \
+            "NAS01 became unavailable before ${collector_display_name} archive validation."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ ! -f "${nas_archive_path}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS archive does not exist: ${nas_archive_path}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ ! -f "${nas_checksum_path}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS checksum does not exist: ${nas_checksum_path}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    checksum_filename="$(basename -- "${nas_checksum_path}")"
+
+    log_info \
+        "Validating ${collector_display_name} NAS01 archive checksum."
+
+    if ! (
+        cd -- "${nas_temporary_directory}" &&
+        sha256sum --check "${checksum_filename}"
+    ); then
+        operator_error \
+            "${collector_display_name} NAS01 checksum validation failed."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_info \
+        "Testing ${collector_display_name} NAS01 archive readability."
+
+    if ! tar \
+        --zstd \
+        --list \
+        --file "${nas_archive_path}" \
+        > /dev/null; then
+
+        operator_error \
+            "${collector_display_name} NAS01 archive is unreadable or structurally invalid."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_success \
+        "${collector_display_name} NAS01 checksum and readability validation passed."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _promote_nas_backup
+#
+# Purpose:
+#     Rename a validated temporary NAS copy to its final backup name.
+###############################################################################
+
+_promote_nas_copy() {
+
+    local collector_display_name="${1:-}"
+    local nas_temporary_directory="${2:-}"
+    local nas_final_directory="${3:-}"
+    local destination_parent
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "NAS promotion received an empty collector display name."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -d "${nas_temporary_directory}" ]]; then
+        operator_error \
+            "Validated ${collector_display_name} NAS temporary backup does not exist: ${nas_temporary_directory}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ -z "${nas_final_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS promotion received an empty final destination."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! _nas_is_available; then
+        operator_warning \
+            "NAS01 became unavailable before ${collector_display_name} promotion."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ -e "${nas_final_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS validated destination already exists: ${nas_final_directory}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    destination_parent="$(dirname -- "${nas_final_directory}")"
+
+    if ! create_directory "${destination_parent}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} NAS validated parent: ${destination_parent}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_info \
+        "Promoting validated ${collector_display_name} NAS01 backup."
+    log_info \
+        "NAS validated destination: ${nas_final_directory}"
+
+    if ! safe_move \
+        "${nas_temporary_directory}" \
+        "${nas_final_directory}"; then
+
+        operator_error \
+            "Unable to promote validated ${collector_display_name} NAS01 backup."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    log_success \
+        "Validated ${collector_display_name} NAS01 backup promoted successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _quarantine_nas_backup
+#
+# Purpose:
+#     Move an incomplete or invalid NAS01 copy into NAS quarantine.
+###############################################################################
+
+_quarantine_nas_copy() {
+
+    local collector_display_name="${1:-}"
+    local nas_temporary_directory="${2:-}"
+    local nas_quarantine_directory="${3:-}"
+    local destination_parent
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "NAS quarantine received an empty collector display name."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ ! -e "${nas_temporary_directory}" ]]; then
+        operator_error \
+            "No ${collector_display_name} NAS temporary backup exists to quarantine: ${nas_temporary_directory}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ -z "${nas_quarantine_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS quarantine received an empty destination."
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if ! _nas_is_available; then
+        operator_warning \
+            "NAS01 became unavailable before ${collector_display_name} quarantine."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    if [[ -e "${nas_quarantine_directory}" ]]; then
+        operator_error \
+            "${collector_display_name} NAS quarantine destination already exists: ${nas_quarantine_directory}"
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    destination_parent="$(dirname -- "${nas_quarantine_directory}")"
+
+    if ! create_directory "${destination_parent}"; then
+        operator_error \
+            "Unable to create ${collector_display_name} NAS quarantine parent: ${destination_parent}"
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    operator_warning \
+        "Moving failed ${collector_display_name} NAS01 copy into quarantine."
+    log_info \
+        "NAS quarantine destination: ${nas_quarantine_directory}"
+
+    if ! safe_move \
+        "${nas_temporary_directory}" \
+        "${nas_quarantine_directory}"; then
+
+        operator_error \
+            "Unable to move failed ${collector_display_name} NAS01 copy into quarantine."
+        return "${POLARIS_BACKUP_NAS_FAILED}"
+    fi
+
+    operator_warning \
+        "Failed ${collector_display_name} NAS01 copy moved to quarantine."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _apply_validated_retention
+#
+# Purpose:
+#     Remove one collector's validated backups older than the approved local
+#     and NAS retention periods.
+#
+# Arguments:
+#     $1 - Collector machine name
+#     $2 - Collector display name
+###############################################################################
+
+_apply_validated_retention() {
+
+    local collector_name="${1:-}"
+    local collector_display_name="${2:-}"
+
+    local local_validated_directory
+    local nas_validated_directory
+    local expired_backup
+    local newest_local_backup=""
+    local newest_nas_backup=""
+    local retention_failed=0
+
+    if [[ -z "${collector_name}" ]]; then
+        operator_error \
+            "Validated retention received an empty collector name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Validated retention received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    local_validated_directory="${POLARIS_LOCAL_VALIDATED_ROOT}/${collector_name}"
+    nas_validated_directory="${POLARIS_NAS_VALIDATED_ROOT}/${collector_name}"
+
+    log_info \
+        "Applying ${collector_display_name} local validated-backup retention: ${POLARIS_LOCAL_VALIDATED_RETENTION_DAYS} days."
+
+    if [[ -d "${local_validated_directory}" ]]; then
+
+        # The single most recent validated backup is never removed by age
+        # alone, regardless of the retention window. A collector whose
+        # configuration hasn't changed produces no new backup on a given
+        # run, so without this guard a long-stable device would eventually
+        # have its only remaining backup aged out entirely - leaving zero
+        # validated coverage with nothing in the pipeline to flag it. This
+        # only ever protects exactly one directory per collector; anything
+        # else that is expired is still removed normally.
+        newest_local_backup="$(
+            find "${local_validated_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+            | sort \
+            | tail -n 1
+        )"
+
+        while IFS= read -r -d '' expired_backup; do
+
+            if [[ -n "${newest_local_backup}" && "${expired_backup}" == "${newest_local_backup}" ]]; then
+                log_info \
+                    "Skipping removal of ${collector_display_name}'s most recent local validated backup (last remaining copy is protected regardless of age): ${expired_backup}"
+
+                continue
+            fi
+
+            log_info \
+                "Removing expired ${collector_display_name} local validated backup: ${expired_backup}"
+
+            if ! rm -rf -- "${expired_backup}"; then
+                operator_error \
+                    "Unable to remove expired ${collector_display_name} local validated backup: ${expired_backup}"
+
+                retention_failed=1
+            fi
+
+        done < <(
+            find "${local_validated_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -mtime "+${POLARIS_LOCAL_VALIDATED_RETENTION_DAYS}" \
+                -print0
+        )
+
+    else
+        log_info \
+            "No ${collector_display_name} local validated-backup directory exists yet: ${local_validated_directory}"
+    fi
+
+    if ! _nas_is_available; then
+        log_info \
+            "NAS01 is unavailable; ${collector_display_name} NAS validated-backup retention was skipped."
+
+        if (( retention_failed != 0 )); then
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        fi
+
+        return "${POLARIS_BACKUP_SUCCESS}"
+    fi
+
+    log_info \
+        "Applying ${collector_display_name} NAS01 validated-backup retention: ${POLARIS_NAS_VALIDATED_RETENTION_DAYS} days."
+
+    if [[ -d "${nas_validated_directory}" ]]; then
+
+        newest_nas_backup="$(
+            find "${nas_validated_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+            | sort \
+            | tail -n 1
+        )"
+
+        while IFS= read -r -d '' expired_backup; do
+
+            if [[ -n "${newest_nas_backup}" && "${expired_backup}" == "${newest_nas_backup}" ]]; then
+                log_info \
+                    "Skipping removal of ${collector_display_name}'s most recent NAS01 validated backup (last remaining copy is protected regardless of age): ${expired_backup}"
+
+                continue
+            fi
+
+            log_info \
+                "Removing expired ${collector_display_name} NAS01 validated backup: ${expired_backup}"
+
+            if ! rm -rf -- "${expired_backup}"; then
+                operator_error \
+                    "Unable to remove expired ${collector_display_name} NAS01 validated backup: ${expired_backup}"
+
+                retention_failed=1
+            fi
+
+        done < <(
+            find "${nas_validated_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -mtime "+${POLARIS_NAS_VALIDATED_RETENTION_DAYS}" \
+                -print0
+        )
+
+    else
+        log_info \
+            "No ${collector_display_name} NAS01 validated-backup directory exists yet: ${nas_validated_directory}"
+    fi
+
+    if (( retention_failed != 0 )); then
+        operator_error \
+            "One or more expired ${collector_display_name} validated backups could not be removed."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_success \
+        "${collector_display_name} validated-backup retention completed successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _apply_quarantine_retention
+#
+# Purpose:
+#     Remove one collector's quarantined backups older than the approved local
+#     and NAS quarantine-retention periods.
+#
+# Arguments:
+#     $1 - Collector machine name
+#     $2 - Collector display name
+###############################################################################
+
+_apply_quarantine_retention() {
+
+    local collector_name="${1:-}"
+    local collector_display_name="${2:-}"
+
+    local local_quarantine_directory
+    local nas_quarantine_directory
+    local expired_backup
+    local retention_failed=0
+
+    if [[ -z "${collector_name}" ]]; then
+        operator_error \
+            "Quarantine retention received an empty collector name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    if [[ -z "${collector_display_name}" ]]; then
+        operator_error \
+            "Quarantine retention received an empty collector display name."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    local_quarantine_directory="${POLARIS_LOCAL_QUARANTINE_ROOT}/${collector_name}"
+    nas_quarantine_directory="${POLARIS_NAS_QUARANTINE_ROOT}/${collector_name}"
+
+    log_info \
+        "Applying ${collector_display_name} local quarantine retention: ${POLARIS_LOCAL_QUARANTINE_RETENTION_DAYS} days."
+
+    if [[ -d "${local_quarantine_directory}" ]]; then
+
+        while IFS= read -r -d '' expired_backup; do
+
+            log_info \
+                "Removing expired ${collector_display_name} local quarantined backup: ${expired_backup}"
+
+            if ! rm -rf -- "${expired_backup}"; then
+                operator_error \
+                    "Unable to remove expired ${collector_display_name} local quarantined backup: ${expired_backup}"
+
+                retention_failed=1
+            fi
+
+        done < <(
+            find "${local_quarantine_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -mtime "+${POLARIS_LOCAL_QUARANTINE_RETENTION_DAYS}" \
+                -print0
+        )
+
+    else
+        log_info \
+            "No ${collector_display_name} local quarantine directory exists yet: ${local_quarantine_directory}"
+    fi
+
+    if ! _nas_is_available; then
+        log_info \
+            "NAS01 is unavailable; ${collector_display_name} NAS quarantine retention was skipped."
+
+        if (( retention_failed != 0 )); then
+            return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+        fi
+
+        return "${POLARIS_BACKUP_SUCCESS}"
+    fi
+
+    log_info \
+        "Applying ${collector_display_name} NAS01 quarantine retention: ${POLARIS_NAS_QUARANTINE_RETENTION_DAYS} days."
+
+    if [[ -d "${nas_quarantine_directory}" ]]; then
+
+        while IFS= read -r -d '' expired_backup; do
+
+            log_info \
+                "Removing expired ${collector_display_name} NAS01 quarantined backup: ${expired_backup}"
+
+            if ! rm -rf -- "${expired_backup}"; then
+                operator_error \
+                    "Unable to remove expired ${collector_display_name} NAS01 quarantined backup: ${expired_backup}"
+
+                retention_failed=1
+            fi
+
+        done < <(
+            find "${nas_quarantine_directory}" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -mtime "+${POLARIS_NAS_QUARANTINE_RETENTION_DAYS}" \
+                -print0
+        )
+
+    else
+        log_info \
+            "No ${collector_display_name} NAS01 quarantine directory exists yet: ${nas_quarantine_directory}"
+    fi
+
+    if (( retention_failed != 0 )); then
+        operator_error \
+            "One or more expired ${collector_display_name} quarantined backups could not be removed."
+
+        return "${POLARIS_BACKUP_INTERNAL_ERROR}"
+    fi
+
+    log_success \
+        "${collector_display_name} quarantine retention completed successfully."
+
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Function:
+#     _apply_all_retention
+#
+# Purpose:
+#     Apply local retention once per orchestrator execution for every active
+#     collector. NAS retention is attempted only when NAS01 is available.
+
+###############################################################################
+# Function:
+#     _apply_all_retention
+#
+# Purpose:
+#     Apply validated and quarantine retention for the proxmox-ai collector.
+###############################################################################
+
+_apply_all_retention() {
+
+    local retention_result
+    local overall_retention_result="${POLARIS_BACKUP_SUCCESS}"
+
+    log_info "Starting scheduled retention for ${POLARIS_AI_COLLECTOR_DISPLAY_NAME}."
+
+    _apply_validated_retention \
+        "${POLARIS_AI_COLLECTOR_ID}" \
+        "${POLARIS_AI_COLLECTOR_DISPLAY_NAME}"
+    retention_result=$?
+
+    if (( retention_result != POLARIS_BACKUP_SUCCESS )); then
+        overall_retention_result="${retention_result}"
+    fi
+
+    _apply_quarantine_retention \
+        "${POLARIS_AI_COLLECTOR_ID}" \
+        "${POLARIS_AI_COLLECTOR_DISPLAY_NAME}"
+    retention_result=$?
+
+    if (( retention_result != POLARIS_BACKUP_SUCCESS )); then
+        overall_retention_result="${retention_result}"
+    fi
+
+    if (( overall_retention_result != POLARIS_BACKUP_SUCCESS )); then
+        operator_error "One or more retention operations failed."
+        return "${overall_retention_result}"
+    fi
+
+    log_success "Scheduled retention completed for ${POLARIS_AI_COLLECTOR_DISPLAY_NAME}."
+    return "${POLARIS_BACKUP_SUCCESS}"
+}
+
+###############################################################################
+# Direct execution
+###############################################################################
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+    exit $?
+fi
