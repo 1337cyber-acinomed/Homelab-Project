@@ -1,0 +1,16 @@
+# Never commit secrets or runtime state
+*.key
+*.pem
+*.pfx
+*.p12
+*.kdbx
+.env
+*.env
+credentials*
+*_api_token
+logs/
+*.log
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
