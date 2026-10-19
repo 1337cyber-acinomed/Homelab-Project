@@ -2,7 +2,7 @@
 
 **Jesse Breedlove** · GitHub `AcinomedCyber` · B.S. Computer Science · A.A.S. Cybersecurity (85% complete)
 
-Project Polaris is a three-node Proxmox homelab I designed, built and documented from scratch between **June and October 2026**. It is run like a small enterprise: every change goes through a gated runbook with a backup first, a validation step and written evidence. It has four parts:
+Project Polaris is a three-node Proxmox homelab I designed, built and documented from scratch between **September 2025 and October 2026**. It is run like a small enterprise: every change goes through a gated runbook with a backup first, a validation step and written evidence. It has four parts:
 
 - **An isolated cyber range** behind its own OPNsense firewall, with 12 VLANs: attack hosts, an Active Directory target forest, Linux and web-app targets, a Wazuh SIEM with AI-assisted alert triage, breach-and-attack simulation, a hybrid pivot capstone and an OSCP-style exam lab. Its fail-closed containment has been tested under a real outage.
 - **A layered network**: Starlink → pfSense home-edge firewall → pfSense lab firewall → managed VLAN switch, with Pi-hole DNS, an AD domain and a two-tier PKI.
