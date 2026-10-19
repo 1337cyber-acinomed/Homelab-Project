@@ -1,7 +1,7 @@
 # GATE 10 — OSCP PRACTICE LAB (VLAN 80)
 
 **Project Polaris | Build-gate and operations doc for the OSCP-exam-style practice lab**
-**Version 0.2 | 15 October 2026 | Status: BUILDING — Phase A complete (VLAN 80 validated); Phase B box 1 (oscp-linux01) CLOSED**
+**Version 1.0 | 19 October 2026 | Status: ✅ GATE 10 COMPLETE — 6-box exam core built & sealed (100 pts). A6-81 + A7 closed. Technique annex (Phase E) is the only remaining optional scope.**
 
 > Companion to `RUN-003`. RUN-003 remains the master runbook; this doc owns the VLAN 80 lab's design, roster, flag model, build-access SOP, and phased build. Nothing in here is built until the operator approves each bounded phase. No IP/VLAN/VMID/firewall change is made ahead of approval.
 
@@ -181,7 +181,13 @@ Mirrors the VLAN 70/71 infra build. **Each step is operator-executed; nothing he
 | 14 Oct 2026 | **Build access:** temporary kali01→box (SSH / `xfreerdp /clipboard`), removed and verified before each `oscp-baseline` snapshot. |
 | 15 Oct 2026 | **Phase A complete.** VLAN 80 + 81 interfaces, DHCP/DNS, firewall policy, the two-way attack path (forward `CYBER_ATTACK→CYBER_OSCP` on the CYBER_ATTACK iface + reverse `CYBER_OSCP→CYBER_ATTACK` on the OSCP iface), and pivot-only 81 all built. VLAN 80 validated on the real box 1 (A6-80). **A6 (VLAN 81 isolation proof) + A7 (XML export + closure) deferred to the first box on 81 (VM381, Phase C).** |
 | 15 Oct 2026 | **Box 1 (oscp-linux01, VM384) CLOSED** — see Build Log §11. |
+| 17 Oct 2026 | **Box 2 (oscp-win01, VM385) CLOSED** — Windows SMB→WinRM foothold + unquoted-service-path privesc. See Build Log §11 (+ build gotchas). |
+| 17 Oct 2026 | **Box 3 (oscp-mix01, VM386) CLOSED** — Debian 11 (EOL/archived), Drupalgeddon2 (MSF-permitted) → PwnKit (snapshot polkit). **Phase B complete: all 3 standalones = 60 pts.** See Build Log §11 (+ build gotchas). |
 | 15 Oct 2026 | **Operator request:** add a legitimate, publicly-available **OSCP exam-rules write-up** to the final/closeout runbook. Tracked as a closeout deliverable. |
+| 18 Oct 2026 | **A6-81 CLOSED** — with the DC live on VLAN 81, pings/ports from VLAN 10 and VLAN 80 to `10.10.81.10` all fail: pivot-only isolation proven on a real host. |
+| 19 Oct 2026 | **Phase C (AD set) CLOSED** — `oscp.lab` forest; SQLi→WinRM foothold (381) → Kerberoast→lateral (382) → LSA-dump→DCSync→Domain Admin (383). 40 pts. See Build Log §11. |
+| 19 Oct 2026 | **A7 CLOSED** — post-build OPNsense config XML exported (`config-OPNsense01.polaris.home.arpa-20261019*.xml`). Phase A fully recorded. |
+| 19 Oct 2026 | **🏁 GATE 10 COMPLETE** — 6-box exam core built, sealed, snapshotted (100 pts, pass ≥70). Only the optional technique annex (Phase E) remains. |
 
 ---
 
@@ -191,7 +197,13 @@ Mirrors the VLAN 70/71 infra build. **Each step is operator-executed; nothing he
 
 | Box | VMID | Address | Points | `local.txt` | `proof.txt` | Status |
 |---|---|---|---|---|---|---|
-| oscp-linux01 | 384 | 10.10.80.11 | 20 (10/10) | `FLAG-REDACTED` | `FLAG-REDACTED` | **CLOSED 15 Oct 2026** |
+| oscp-linux01 | 384 | 10.10.80.11 | 20 (10/10) | `23aac5315a183baff083d8c1a48e5aa9` | `8f81fbbe38d0ade4eaf953437fa6e113` | **CLOSED 15 Oct 2026** |
+| oscp-win01 | 385 | 10.10.80.12 | 20 (10/10) | `a87a37839e9131850e5fc7cf27b54053` | `a1eefc5c25cc8b4100d76311f859872c` | **CLOSED 17 Oct 2026** |
+| oscp-mix01 | 386 | 10.10.80.13 | 20 (10/10) | `76961c04c4cb941279f497b558ccd3c3` | `8531437153db8b82b887ecef92788301` | **CLOSED 17 Oct 2026** |
+| **AD set `oscp.lab` (40 pts, chained)** | | | | | | |
+| oscp-ext01 | 381 | 10.10.80.14 (+81: .11) | 10 (foothold) | `e66ab3bea8e1efb48be04629306c381f` | — | **CLOSED 19 Oct 2026** |
+| oscp-ws01 | 382 | 10.10.81.12 | 10 (lateral) | — | `9cb57975fc1a75e036a7af2a26fcd69d` | **CLOSED 19 Oct 2026** |
+| oscp-dc01 | 383 | 10.10.81.10 | 20 (Domain Admin) | — | `b438d1e7ce4dc6f10bfcb0c143d0b41b` | **CLOSED 19 Oct 2026** |
 
 **Box 1 — `oscp-linux01` (VM384, 10.10.80.11)** — Debian 12; console name `cyber-oscp-linux01`, lab hostname `webdev01`.
 - **Foothold (A):** Apache/PHP "Meridian NetOps" site; unlinked `tools.php` diagnostics page runs `shell_exec("ping -c 1 " . $_GET['host'])` with no sanitization → command injection → `www-data`.
@@ -202,6 +214,44 @@ Mirrors the VLAN 70/71 infra build. **Each step is operator-executed; nothing he
 - **Build access (removed):** kali01→384:22 via the recycled LAN→CYBER_OSCP temp-ssh rule (now disabled) + a temp `builder` sudo user (deleted). Seal verified — kali01 cannot reach it; kali02 gets HTTP 200.
 - **Covers:** web enum, command injection, credential reuse/hunting, lateral-to-user, sudo-GTFOBins privesc.
 
+**Box 2 — `oscp-win01` (VM385, 10.10.80.12)** — Windows Server 2019 Std (Desktop Experience); console name `cyber-oscp-win01`, host `WIN-BGNT6RFC7PQ`.
+- **Foothold (A):** guest-readable SMB share `IT` (`C:\Shares\IT\Handover.txt`) leaks low-priv creds `jbrown` / `Br0wn!Helpdesk25`; `jbrown` is in Remote Management Users → WinRM shell → `local.txt` (on jbrown's profile Desktop, `C:\Users\jbrown.WIN-BGNT6RFC7PQ\Desktop`).
+- **Privesc (i):** service `MeridianBackup` runs as LocalSystem with an **unquoted `ImagePath`** (`C:\Program Files\Meridian Backup\service agent\backup.exe`); `Authenticated Users` have **Modify** on `C:\Program Files\Meridian Backup\`, and `jbrown` has start/stop rights on the service → plant `service.exe` in that segment → SYSTEM → `proof.txt` (`C:\Users\Administrator\Desktop`).
+- **Final exposure:** SMB 445 + WinRM 5985 open to VLAN 10 only; RDP off; no kali01 path.
+- **Reset:** `oscp-baseline` snapshot (2026-10-17 11:23); manual rollback only, excluded from the 96h auto-revert.
+- **Build access (removed):** kali01→385:3389 (RDP, `xfreerdp /clipboard`) via the recycled LAN→CYBER_OSCP temp rule (now disabled); RDP turned back off. Seal verified — kali01 cannot reach it; kali02 lists the `IT` share.
+- **Covers:** SMB enum, credential discovery, WinRM auth, unquoted-service-path privesc.
+
+**Box 3 — `oscp-mix01` (VM386, 10.10.80.13)** — Debian 11 (bullseye, EOL/archived — deliberately behind on patches); console name `cyber-oscp-mix01`, lab hostname `intranet01`. The **Metasploit-permitted** box.
+- **Foothold (A / public exploit, MSF-permitted):** **Drupal 7.57** at `/var/www/html` (Drupalgeddon2, CVE-2018-7600, < 7.58) → `www-data`. DB `drupal`/`drupal`/`DrupalDB2024` (MariaDB). `local.txt` in `/var/www`.
+- **Privesc (i / compile-a-public-PoC):** **PwnKit** — `policykit-1` pinned to the vulnerable **`0.105-31`** (from `snapshot.debian.org`, `apt-mark hold`), SUID `pkexec`; compile the public PoC on-box (`build-essential` present) → root → `proof.txt` in `/root`.
+- **Final exposure:** 80 open to VLAN 10 only; `gcc`/`build-essential` intact (needed for the on-box PoC compile); no kali01 path.
+- **Reset:** `oscp-baseline` snapshot (2026-10-17 21:43); manual rollback only, excluded from the 96h auto-revert.
+- **Build access (removed):** kali01→386:22 (SSH) + a temp :80 allow for the Drupal web-install, via the recycled LAN→CYBER_OSCP rule (now disabled) + a temp `builder` sudo user (deleted). Seal verified — kali01 cannot reach it; kali02 gets HTTP 200.
+- **Covers:** web enum, find/use a public exploit (+MSF), compile-a-public-PoC Linux privesc.
+
+**AD set — `oscp.lab` (VM381/382/383, 40-pt chain)** — forest `oscp.lab` / NetBIOS `OSCP`, DC `OSCP-DC01` on Server 2022, `OSCP-WS01` Win10, `OSCP-EXT01` Server 2019 dual-homed (VLAN 80 `.14` + VLAN 81 `.11`). Separate forest from production `corp.cyberrange.local`. DC DNS forwarder → `10.10.81.1`.
+- **Foothold — 381 (10 pts):** PHP + SQLite "Meridian Employee Directory" (`C:\web`, served by `php -S 0.0.0.0:80` via the `PortalWeb` scheduled task; Chocolatey-installed PHP 8.5 — XAMPP abandoned, see notes). UNION-SQLi on `?q=` dumps a `credentials` table leaking `OSCP\jtorres` / `Autumn2024Torres`; jtorres is in Remote Management Users on 381 → **WinRM** → `local.txt`.
+- **Lateral — 382 (10 pts):** as jtorres, **Kerberoast** `svc_sql` (SPN `MSSQLSvc/oscp-ext01.oscp.lab:1433`, pw `Welcome123`) → crack → `svc_sql` is **local admin on 382** → pivot through dual-homed 381 → evil-winrm/psexec to 382 → `proof.txt`; **dump LSA secrets** (the disabled `BackupAgent` service runs as `svc_backup`, storing its plaintext) → recover `svc_backup`.
+- **Domain Admin — 383 (20 pts):** `svc_backup` holds **DCSync** rights (Replicating Directory Changes [All], granted via `dsacls`) → replicate the `Administrator` hash → PtH → **383** → `proof.txt`. Bonus: **AS-REP-roastable** `mrossi` (`Spring2022`).
+- **Pivot-only enforced:** attacker reaches only 381 (VLAN 80: web 80 + WinRM 5985 from VLAN 10). 382/383 on VLAN 81 are reachable only by tunneling through compromised 381 (A6-81 proven). 382 opens WinRM/SMB from `10.10.81.0/24`.
+- **Final exposure:** 381 → 80 + 5985 to VLAN 10; 382/383 → VLAN 81 only; RDP off on all three; no kali01 path.
+- **Reset:** `oscp-baseline` snapshots (2026-10-19, all three; crash-consistent — guest-agent VSS timeout, fine for revert); manual rollback only, excluded from auto-revert.
+- **Build access (removed):** kali01→VLAN 80/81 : 3389 (RDP) via the recycled LAN→CYBER_OSCP + LAN→CYBER_OSCP_INT temp rules (now disabled); RDP off on all three.
+- **Covers:** web SQLi, WinRM auth, BloodHound/AD enum, Kerberoast, AS-REP, lateral movement, LSA-secret credential dumping, DCSync → Domain Admin.
+
+### Build gotchas (apply to the AD Windows boxes 381/382, and future Linux boxes)
+- **Do NOT pre-create a user's profile folder** (`C:\Users\<user>\...`) before that user's first logon. Doing so makes Windows spin up a differently-named profile (`<user>.<HOST>`) on first logon, and anything placed in the pre-created folder is orphaned. Create the user, let them log on once (WinRM/interactive) to materialize the profile, **then** place flags/files — or detect the real profile path via `Get-CimInstance Win32_UserProfile -Filter "SID='<sid>'"`.
+- Unquoted-service-path vuln: `sc create` with a quoted `binPath` stores it quoted (safe). Force the vuln by writing `ImagePath` directly as an **unquoted `ExpandString`** in the registry.
+- **Debian 11 is EOL/archived (2026):** the netinst installer's "select software" step fails if a desktop task is chosen (pick only SSH server + standard utils), and apt must point at **`archive.debian.org`** (`deb.debian.org`/`security.debian.org` 404 the pool) with `Acquire::Check-Valid-Until "false"`.
+- **PwnKit needs the pre-fix polkit:** the archive's `main` only carries the patched `0.105-31+deb11u1`; pull the vulnerable `0.105-31` (+ `libpolkit-agent-1-0`, `libpolkit-gobject-1-0`) from `snapshot.debian.org` (dated before 2022-01-25), `dpkg -i`, and `apt-mark hold`. A minimal install lacks `libglib2.0-0` (install it, then `dpkg --configure -a`).
+- **On-target exploit compiles need `build-essential`**, not just `gcc` — a bare `gcc` without `libc6-dev` makes a self-compiling PoC (e.g. PwnKit's gconv module) fail silently ("could not convert … to EVIL", no root).
+- **Shell gotcha:** a `!` in a password passed inside double quotes triggers bash history expansion ("event not found"); use `!`-free values for anything that goes through the shell, or single-quote / `set +H`.
+- **Windows web-stack on an offline/no-browser box:** Server 2019 ships IE only, and sourceforge direct links return an HTML interstitial (saved `.exe` is "corrupted and unreadable"). Skip XAMPP/sourceforge — use **Chocolatey** (`iex (New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')`, then `choco install -y php`, `refreshenv`). Serve a SQLi app with `php -S` + SQLite via a startup Scheduled Task; enable `pdo_sqlite`/`sqlite3` in `C:\tools\php85\php.ini` (append `extension_dir`, `extension=pdo_sqlite`, `extension=sqlite3`).
+- **Dual-homed AD member (381):** default gateway on the **attacker-facing** NIC (VLAN 80) so it can answer VLAN 10; **no** gateway on the internal NIC (VLAN 81, L2 to the DC); DNS = the DC on **both** NICs; add a `Add-DnsServerForwarder` on the DC for internet resolution. Combined join+rename can race ("directory service is busy") — join first, then `Rename-Computer -DomainCredential`.
+- **DCSync seed:** grant a non-DA account Replicating Directory Changes [All] via `dsacls <domainDN> /G "DOM\user:CA;Replicating Directory Changes[ All]"`; stage its creds for recovery by setting a disabled service's logon account to it (`sc config <svc> obj= ... password= ...` stores it as an LSA secret, dumpable by a local admin — no need for the service to run).
+- Guest/anonymous SMB share listing needs `RestrictNullSessAccess=0`, the share in `NullSessionShares`, and `everyoneincludesanonymous=1`, plus `Restart-Service LanmanServer`.
+
 ---
 
-*Next action: build **Phase B box 2** (`oscp-win01`, VM385 — Windows, service/creds foothold → SYSTEM). Phase C (AD set) then closes out A6-81 + A7.*
+*Status: **GATE 10 COMPLETE.** The 6-box exam core (3 standalones @ 20 + a 40-pt AD chain = 100 pts, pass ≥70) is built, sealed, and snapshotted on VLAN 80/81, no SIEM, manual reset. A6-81 and A7 are closed. Remaining optional scope: **Phase E — the technique annex** (BOF, CMS, privesc samplers) and the operator-requested **OSCP exam-rules write-up** for the closeout runbook — both deferred until requested.*
